@@ -9,6 +9,7 @@ use smart_contract::log;
 use smart_contract::payload::Parameters;
 use smart_contract::transaction::{Transaction, Transfer};
 
+const MAX_HISTORY_CAPACITY: usize = 100;
 static mut COUNTER: u32 = 0;
 
 fn generate_id() -> String {
@@ -34,6 +35,12 @@ fn random(params: &Parameters) -> u32 {
     let num = rng.gen_range(0, 100);
 
     return num;
+}
+
+fn prune_old_history(p: &mut PrisonerDilemma) {
+    if p.history.len() > MAX_HISTORY_CAPACITY {
+        p.history.remove(0);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -77,8 +84,6 @@ impl Match {
             self.p2_payout = -(p2.stake as i64);
 
             self.total_pot_paid = (self.p1.stake + p2.stake) as i64;
-//            self.pot += p1.stake;
-//            self.pot += p2.stake;
         } else if self.p1.vote == 1 && p2.vote == 1 {
             // Both players get back their stakes plus pot rewards
 
@@ -187,7 +192,8 @@ impl PrisonerDilemma {
             self.threshold -= 1;
         }
 
-        let i = match self.waiting.iter_mut().position(|m| m.p1.sender != sender) {
+        // Get the first match in the list
+        let index = match self.waiting.iter_mut().position(|m| m.p1.sender != sender) {
             Some(v) => v,
             None => {
                 let id = generate_id();
@@ -199,30 +205,46 @@ impl PrisonerDilemma {
             }
         };
 
-        let mut m = self.waiting.get(i).unwrap().clone();
-
-        self.waiting.remove(i);
-
+        let m = self.waiting.get_mut(index).unwrap();
         m.play(p, self.pot);
 
-        // Update the players' balances
-
         let p2 = m.p2.clone().unwrap();
+
+        // Update the players' balances
 
         update_balance(&mut self.balances, p2.sender, m.p2_payout);
         update_balance(&mut self.balances, m.p1.sender, m.p1_payout);
 
         // Update the pot.
+
         let mut new_pot: i64 = self.pot as i64 + m.total_pot_paid;
         if new_pot < 0 {
             new_pot = 0;
         }
         self.pot = new_pot as u64;
 
-        // Save the match
+        let result = json!({
+            "match_id": m.id,
+            "player_1": json!({
+                            "sender": to_hex_string(m.p1.sender),
+                            "payout": m.p1_payout,
+                        }),
+            "player_2": json!({
+                            "sender": to_hex_string(p2.sender),
+                            "payout": m.p2_payout,
+                        }),
+        });
+
+        // Save the match into the history list
         self.history.push(m.clone());
 
-        // TODO prune the history
+        // Remove the match from the waiting list
+        self.waiting.remove(index);
+
+        // Prune old history if needed
+        prune_old_history(self);
+
+        log(&result.to_string());
 
         Ok(())
     }
@@ -231,13 +253,14 @@ impl PrisonerDilemma {
         let id: String = params.read();
 
         if self.waiting.iter().find(|m| m.id == id).is_some() {
+            log(&format!("Your match is still waiting for other player."));
             return Err("Your match is still waiting for other player.".into());
         }
 
         let found = match self.history.iter().find(|m| m.id == id) {
             Some(m) => m,
             None => {
-//                log(&format!("The match {} does not exist.", id));
+                log(&format!("The match {} does not exist.", id));
                 return Err("The match does not exist.".into());
             }
         };

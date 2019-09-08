@@ -32,15 +32,29 @@ fn random(params: &Parameters) -> u32 {
     };
     let mut rng = rand::rngs::SmallRng::from_seed(seed);
 
-    let num = rng.gen_range(0, 100);
-
-    return num;
+    return rng.gen_range(0, 100);
 }
 
 fn prune_old_history(p: &mut PrisonerDilemma) {
     if p.history.len() > MAX_HISTORY_CAPACITY {
         p.history.remove(0);
     }
+}
+
+fn update_balance(balances: &mut HashMap<[u8; 32], u64>, sender: [u8; 32], amount: i64) {
+    let recipient_balance = match balances.get(&sender) {
+        Some(balance) => *balance,
+        None => 0,
+    };
+
+    let mut updated = recipient_balance as i64 + amount;
+    if updated.is_negative() {
+        // This should never happen.
+
+        updated = 0
+    }
+
+    balances.insert(sender, updated as u64);
 }
 
 #[derive(Debug, Clone)]
@@ -57,9 +71,12 @@ struct Match {
     p1: Player,
     p2: Option<Player>,
 
-    p1_payout: i64,
-    p2_payout: i64,
-    total_pot_paid: i64,
+    // The amout goes into Player 1 balance.
+    p1_payout: u64,
+    // The amout goes into Player 2 balance.
+    p2_payout: u64,
+    // The amout goes into pot or minus the pot.
+    pot_payout: i64,
 }
 
 impl Match {
@@ -70,7 +87,7 @@ impl Match {
             p2: None,
             p1_payout: 0,
             p2_payout: 0,
-            total_pot_paid: 0,
+            pot_payout: 0,
         };
 
         return m;
@@ -80,60 +97,46 @@ impl Match {
         if self.p1.vote == 2 && p2.vote == 2 {
             // Both players lose the stakes. The stakes go to the pot
 
-            self.p1_payout = -(self.p1.stake as i64);
-            self.p2_payout = -(p2.stake as i64);
+            self.p1_payout = 0;
+            self.p2_payout = 0;
 
-            self.total_pot_paid = (self.p1.stake + p2.stake) as i64;
+            self.pot_payout = (self.p1.stake + p2.stake) as i64;
         } else if self.p1.vote == 1 && p2.vote == 1 {
             // Both players get back their stakes plus pot rewards
 
-            let p1_pot_payout: i64 = (0.01 * pot as f64) as i64;
-            self.p1_payout = self.p1.stake as i64 + p1_pot_payout;
+            let p1_pot_payout = (0.01 * pot as f64) as u64;
+            self.p1_payout = self.p1.stake + p1_pot_payout;
 
-            let p2_pot_payout: i64 = (0.01 * pot as f64) as i64;
-            self.p2_payout = p2.stake as i64 + p2_pot_payout;
+            let p2_pot_payout = (0.01 * pot as f64) as u64;
+            self.p2_payout = p2.stake + p2_pot_payout;
 
-            self.total_pot_paid = -(p1_pot_payout + p2_pot_payout);
+            self.pot_payout = -(p1_pot_payout + p2_pot_payout) as i64;
         } else if self.p1.vote == 1 && p2.vote == 2 {
             // Player  1 lose his stake
 
-            self.p1_payout = -(self.p1.stake as i64);
+            self.p1_payout = 0;
 
             // Player 2 get back his stake, plus Player 1 stake and pot reward
 
-            let p2_pot_payout: i64 = (0.015 * pot as f64) as i64;
-            self.p2_payout = (p2.stake + self.p1.stake) as i64 + p2_pot_payout;
+            let p2_pot_payout = (0.015 * pot as f64) as u64;
+            self.p2_payout = (p2.stake + self.p1.stake) + p2_pot_payout;
 
-            self.total_pot_paid = -p2_pot_payout;
+            self.pot_payout = -p2_pot_payout as i64;
         } else if self.p1.vote == 2 && p2.vote == 1 {
             // Player 1 get back his stake, plus Player 2 stake and pot reward
 
-            let p1_pot_payout: i64 = (0.015 * pot as f64) as i64;
-            self.p1_payout = (p2.stake + self.p1.stake) as i64 + p1_pot_payout;
+            let p1_pot_payout = (0.015 * pot as f64) as u64;
+            self.p1_payout = (p2.stake + self.p1.stake) + p1_pot_payout;
 
-            self.total_pot_paid = -p1_pot_payout;
+            self.pot_payout = -p1_pot_payout as i64;
 
             // Player 2 lose his stake
 
-            self.p2_payout = -(p2.stake as i64);
+            self.p2_payout = 0;
         }
 
         self.p2 = Some(p2);
     }
-}
-
-fn update_balance(balances: &mut HashMap<[u8; 32], u64>, sender: [u8; 32], amount: i64) {
-    let recipient_balance = match balances.get(&sender) {
-        Some(balance) => *balance,
-        None => 0,
-    };
-
-    let mut updated = recipient_balance as i64 + amount;
-    if updated.is_negative() {
-        updated = 0
-    }
-
-    balances.insert(sender, updated as u64);
 }
 
 struct PrisonerDilemma {
@@ -146,15 +149,11 @@ struct PrisonerDilemma {
 
 #[smart_contract]
 impl PrisonerDilemma {
-    fn init(params: &mut Parameters) -> Self {
-        let mut balances = HashMap::new();
-
-        balances.insert(params.sender, 100_000);
-
+    fn init(_params: &mut Parameters) -> Self {
         Self {
-            balances: balances,
+            balances: HashMap::new(),
             threshold: 50,
-            pot: 100_000,
+            pot: 0,
             waiting: Vec::new(),
             history: Vec::new(),
         }
@@ -179,12 +178,19 @@ impl PrisonerDilemma {
         };
 
         if random(params) > self.threshold {
+            // Create a new match for the player and put the match into the waiting pool
+
             self.threshold += 1;
 
             let id = generate_id();
             self.waiting.push(Match::new(id.clone(), p));
 
-            log(&format!("Created new match {}. Waiting...", id));
+            let result = json!({
+                "match_id": id,
+            });
+
+            log(&result.to_string());
+
             return Ok(());
         }
 
@@ -192,14 +198,19 @@ impl PrisonerDilemma {
             self.threshold -= 1;
         }
 
-        // Get the first match in the list
+        // Put the player with the first match in the waiting pool.
+        // If there's no match in the waiting pool, create a new match for the player.
         let index = match self.waiting.iter_mut().position(|m| m.p1.sender != sender) {
             Some(v) => v,
             None => {
                 let id = generate_id();
                 self.waiting.push(Match::new(id.clone(), p));
 
-                log(&format!("There's no waiting player. Created new match {}. Waiting...", id));
+                let result = json!({
+                    "match_id": id,
+                });
+
+                log(&result.to_string());
 
                 return Ok(());
             }
@@ -212,16 +223,18 @@ impl PrisonerDilemma {
 
         // Update the players' balances
 
-        update_balance(&mut self.balances, p2.sender, m.p2_payout);
-        update_balance(&mut self.balances, m.p1.sender, m.p1_payout);
+        update_balance(&mut self.balances, p2.sender, m.p2_payout as i64);
+        update_balance(&mut self.balances, m.p1.sender, m.p1_payout as i64);
 
         // Update the pot.
 
-        let mut new_pot: i64 = self.pot as i64 + m.total_pot_paid;
+        let mut new_pot: i64 = self.pot as i64 + m.pot_payout;
         if new_pot < 0 {
             new_pot = 0;
         }
         self.pot = new_pot as u64;
+
+        // Generate the match result
 
         let result = json!({
             "match_id": m.id,
@@ -252,22 +265,19 @@ impl PrisonerDilemma {
     fn result(&mut self, params: &mut Parameters) -> Result<(), Box<dyn Error>> {
         let id: String = params.read();
 
+        // Check the match in the waiting pool
         if self.waiting.iter().find(|m| m.id == id).is_some() {
-            log(&format!("Your match is still waiting for other player."));
             return Err("Your match is still waiting for other player.".into());
         }
 
         let found = match self.history.iter().find(|m| m.id == id) {
             Some(m) => m,
             None => {
-                log(&format!("The match {} does not exist.", id));
                 return Err("The match does not exist.".into());
             }
         };
 
         let p2 = found.p2.clone().unwrap();
-
-//        log(&format!("Match {}, Payout {}: {}, Payout {}: {}", found.id, to_hex_string(found.p1.sender), found.p1_payout, to_hex_string(p2.sender), found.p2_payout));
 
         let result = json!({
             "player_1": json!({
